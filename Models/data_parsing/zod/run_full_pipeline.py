@@ -19,12 +19,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
 
-# Allow zod_utils import
-sys.path.insert(0, str(Path(__file__).parent))
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from zod_utils import sequence_output_dir
-
 
 def run_step1(seq: str, zod_root: Path) -> bool:
     """Run step1 timestamp association."""

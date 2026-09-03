@@ -18,7 +18,12 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from zod_utils import get_images_blur_dir
+from zod_utils import (
+    get_images_blur_dir,
+    get_radar_front_dir,
+    get_vehicle_data_path,
+    normalize_sequence_id,
+)
 
 
 def parse_image_timestamp(fname: Path) -> int:
@@ -33,10 +38,18 @@ def parse_image_timestamp(fname: Path) -> int:
 
 def load_radar_timestamps(radar_path: Path) -> np.ndarray:
     """Load unique radar timestamps from the radar_front .npy file."""
-    npy_files = list(radar_path.glob("*.npy"))
+    npy_files = sorted(radar_path.glob("*.npy"))
     if not npy_files:
         raise FileNotFoundError(f"No .npy files in {radar_path}")
+
     data = np.load(npy_files[0], allow_pickle=True)
+
+    if data.dtype.names is None or "timestamp" not in data.dtype.names:
+        raise ValueError(
+            f"Radar file has no structured 'timestamp' field: {npy_files[0]}. "
+            f"Available fields: {data.dtype.names}"
+        )
+
     return np.unique(data["timestamp"])
 
 
@@ -94,19 +107,19 @@ def main():
     )
     args = parser.parse_args()
 
-    zod = Path(args.zod_root)
-    seq = args.sequence
+
+    zod = Path(args.zod_root).expanduser().resolve()
+    seq = normalize_sequence_id(args.sequence)
 
     img_dir = get_images_blur_dir(zod, seq)
-    radar_dir = zod / "radar_front" / "sequences" / seq / "radar_front"
-    vehicle_hdf5 = zod / "vehicle_data" / "sequences" / seq / "vehicle_data.hdf5"
+    radar_dir = get_radar_front_dir(zod, seq)
+    vehicle_hdf5 = get_vehicle_data_path(zod, seq)
 
-    if not img_dir.exists():
-        raise FileNotFoundError(f"Image dir not found: {img_dir}")
-    if not radar_dir.exists():
-        raise FileNotFoundError(f"Radar dir not found: {radar_dir}")
-    if not vehicle_hdf5.exists():
-        raise FileNotFoundError(f"Vehicle HDF5 not found: {vehicle_hdf5}")
+    print(f"Sequence:     {seq}", flush=True)
+    print(f"Images:       {img_dir}", flush=True)
+    print(f"Radar:        {radar_dir}", flush=True)
+    print(f"Vehicle data: {vehicle_hdf5}", flush=True)
+
 
     images = sorted(img_dir.glob("*.jpg"))
     if not images:
@@ -122,7 +135,7 @@ def main():
         ego_vel_ts = ctrl_ts
         ego_vel_ms = np.zeros(len(ctrl_ts))
 
-    radar_npy_files = list(radar_dir.glob("*.npy"))
+    radar_npy_files = sorted(radar_dir.glob("*.npy"))
     if not radar_npy_files:
         raise FileNotFoundError(f"No radar .npy found in {radar_dir}")
     radar_npy = radar_npy_files[0]
