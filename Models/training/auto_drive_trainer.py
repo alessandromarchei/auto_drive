@@ -2,6 +2,8 @@
 
 import sys
 import math
+import copy
+from contextlib import nullcontext
 from pathlib import Path
 
 import matplotlib
@@ -79,16 +81,40 @@ class AutoDriveTrainer:
 
     def __init__(self, tensorboard_dir: str = "runs",
                  train_mode: str = TRAIN_MODE_JOINT,
-                 autospeed_ckpt: str = ""):
+                 autospeed_ckpt: str = "",
+                 encoder_name: str | None = None,
+                 encoder_pretrained: bool = False,
+                 amp: bool = False,
+                 torch_compile: bool = False,
+                 compile_mode: str = "default"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.train_mode = train_mode
         print(f"AutoDriveTrainer — device: {self.device}  mode: {train_mode}")
 
-        self.model = AutoDrive().to(self.device)
+        self.amp_enabled = bool(amp and self.device.type == "cuda")
+        self.compile_enabled = bool(torch_compile)
+
+        # Keep an unwrapped model for checkpoints, freezing and ONNX export.
+        self.base_model = AutoDrive(
+            encoder_name=encoder_name,
+            encoder_pretrained=encoder_pretrained,
+        ).to(self.device)
 
         # Optionally load pretrained backbone from AutoSpeed
         if autospeed_ckpt:
-            self.model.load_backbone_from_autospeed(autospeed_ckpt)
+            self.base_model.load_backbone_from_autospeed(autospeed_ckpt)
+
+        self.model = self.base_model
+        if self.compile_enabled:
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("--torch-compile requires PyTorch >= 2.0")
+            print(f"torch.compile: enabled (mode={compile_mode})")
+            self.model = torch.compile(self.base_model, mode=compile_mode)
+        else:
+            print("torch.compile: disabled")
+
+        print(f"AMP: {'enabled' if self.amp_enabled else 'disabled'}")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
 
         self.writer = SummaryWriter(log_dir=tensorboard_dir)
 
@@ -107,6 +133,9 @@ class AutoDriveTrainer:
         self.loss_curvature: float = 0.0
         self.loss_flag:      float = 0.0
         self._grad_norm:     float = 0.0
+        self._grad_max_abs:  float = 0.0
+        self._grad_nonfinite: int = 0
+        self._param_norm:    float = 0.0
 
         # Epoch-level running averages
         self.avg_total     = AverageMeter()
@@ -134,7 +163,7 @@ class AutoDriveTrainer:
 
     def _setup_optimizer(self):
         """Build optimizer over trainable parameters only."""
-        trainable = filter(lambda p: p.requires_grad, self.model.parameters())
+        trainable = filter(lambda p: p.requires_grad, self.base_model.parameters())
         self.optimizer = optim.Adam(trainable, lr=self.learning_rate, weight_decay=1e-5)
 
     def _apply_train_mode(self):
@@ -144,32 +173,32 @@ class AutoDriveTrainer:
             # Only curvature loss is computed — distance and flag losses are 0.
             # This lets the head conv+FC layers adapt to the task while the
             # pretrained backbone features stay intact.
-            for p in self.model.backbone.parameters():
+            for p in self.base_model.backbone.parameters():
                 p.requires_grad_(False)
-            for p in self.model.head.parameters():
+            for p in self.base_model.head.parameters():
                 p.requires_grad_(True)
-            n_frozen   = sum(p.numel() for p in self.model.backbone.parameters())
-            n_trainable = sum(p.numel() for p in self.model.head.parameters())
+            n_frozen   = sum(p.numel() for p in self.base_model.backbone.parameters())
+            n_trainable = sum(p.numel() for p in self.base_model.head.parameters())
             print(f"  [mode=curvature] backbone FROZEN ({n_frozen:,} params); "
                   f"full head trainable ({n_trainable:,} params). "
                   f"Curvature loss only.")
         else:
             # Everything trainable end-to-end
-            for p in self.model.parameters():
+            for p in self.base_model.parameters():
                 p.requires_grad_(True)
-            n_total = sum(p.numel() for p in self.model.parameters())
+            n_total = sum(p.numel() for p in self.base_model.parameters())
             print(f"  [mode=joint] all {n_total:,} parameters trainable.")
 
         self._setup_optimizer()  # rebuild after changing requires_grad
 
     def freeze_backbone(self):
-        for p in self.model.backbone.parameters():
+        for p in self.base_model.backbone.parameters():
             p.requires_grad_(False)
         self._setup_optimizer()
         print("  Backbone FROZEN.")
 
     def unfreeze_backbone(self):
-        for p in self.model.backbone.parameters():
+        for p in self.base_model.backbone.parameters():
             p.requires_grad_(True)
         self._setup_optimizer()
         print("  Backbone UNFROZEN.")
@@ -194,12 +223,12 @@ class AutoDriveTrainer:
     # ------------------------------------------------------------------
 
     def set_batch(self, batch: dict):
-        self.img_prev     = batch["img_prev"].to(self.device)
-        self.img_curr     = batch["img_curr"].to(self.device)
-        self.d_norm_gt    = batch["d_norm"].unsqueeze(1).to(self.device)
-        self.curvature_gt = batch["curvature"].unsqueeze(1).to(self.device)
-        self.flag_gt      = batch["flag"].unsqueeze(1).to(self.device)
-        self.dist_mask    = batch["dist_mask"].to(self.device)
+        self.img_prev     = batch["img_prev"].to(self.device, non_blocking=True)
+        self.img_curr     = batch["img_curr"].to(self.device, non_blocking=True)
+        self.d_norm_gt    = batch["d_norm"].unsqueeze(1).to(self.device, non_blocking=True)
+        self.curvature_gt = batch["curvature"].unsqueeze(1).to(self.device, non_blocking=True)
+        self.flag_gt      = batch["flag"].unsqueeze(1).to(self.device, non_blocking=True)
+        self.dist_mask    = batch["dist_mask"].to(self.device, non_blocking=True)
 
         self._img_prev_vis = batch["img_prev"][0]
         self._d_gt_val     = batch["d_norm"][0].item()
@@ -211,10 +240,21 @@ class AutoDriveTrainer:
     # ------------------------------------------------------------------
 
     def run_model(self):
-        d_pred, curv_pred, flag_logits = self.model(self.img_prev, self.img_curr)
+        amp_context = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if self.amp_enabled else nullcontext()
+        )
+        with amp_context:
+            d_pred, curv_pred, flag_logits = self.model(self.img_prev, self.img_curr)
+
+        # Keep reductions/loss accumulation in FP32 when AMP is active.
+        # The objective itself is unchanged from the original trainer.
+        d_pred_loss = d_pred.float()
+        curv_pred_loss = curv_pred.float()
+        flag_logits_loss = flag_logits.float()
 
         # Curvature — always active
-        loss_c = self._l1(curv_pred, self.curvature_gt)
+        loss_c = self._l1(curv_pred_loss, self.curvature_gt)
 
         if self.train_mode == TRAIN_MODE_CURVATURE:
             # Curvature-only: distance and flag losses are zero
@@ -224,11 +264,11 @@ class AutoDriveTrainer:
             # Distance — only when CIPO is detected with a valid distance
             if self.dist_mask.any():
                 mask_idx = self.dist_mask.unsqueeze(1)
-                loss_d   = self._l1(d_pred[mask_idx], self.d_norm_gt[mask_idx])
+                loss_d   = self._l1(d_pred_loss[mask_idx], self.d_norm_gt[mask_idx])
             else:
                 loss_d = torch.tensor(0.0, device=self.device)
             # Flag — always in joint mode
-            loss_f = self._bce(flag_logits, self.flag_gt)
+            loss_f = self._bce(flag_logits_loss, self.flag_gt)
 
         self.loss = (
             self._CURV_LOSS_W * loss_c +
@@ -263,7 +303,16 @@ class AutoDriveTrainer:
         """Returns (total, dist, curv, flag, flag_acc_pct, dist_mae_m, steer_mae_deg)."""
         self.set_batch(batch)
 
-        d_pred, curv_pred, flag_logits = self.model(self.img_prev, self.img_curr)
+        amp_context = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if self.amp_enabled else nullcontext()
+        )
+        with amp_context:
+            d_pred, curv_pred, flag_logits = self.model(self.img_prev, self.img_curr)
+
+        d_pred = d_pred.float()
+        curv_pred = curv_pred.float()
+        flag_logits = flag_logits.float()
 
         loss_c = self._l1(curv_pred, self.curvature_gt)
 
@@ -303,23 +352,37 @@ class AutoDriveTrainer:
     # ------------------------------------------------------------------
 
     def loss_backward(self):
-        self.loss.backward()
+        self.scaler.scale(self.loss).backward()
 
     def run_optimizer(self):
-        # Compute gradient norm before clipping (diagnostic)
-        all_params = [p for p in self.model.parameters() if p.grad is not None]
+        # AMP gradients must be unscaled before measuring/clipping. This keeps
+        # the original max_norm=10 optimization rule mathematically intact.
+        self.scaler.unscale_(self.optimizer)
+        all_params = [p for p in self.base_model.parameters() if p.grad is not None]
         if all_params:
+            with torch.no_grad():
+                self._grad_max_abs = max(
+                    p.grad.detach().abs().max().item() for p in all_params
+                )
+                self._grad_nonfinite = sum(
+                    (~torch.isfinite(p.grad.detach())).sum().item() for p in all_params
+                )
+                self._param_norm = math.sqrt(sum(
+                    p.detach().float().pow(2).sum().item()
+                    for p in self.base_model.parameters()
+                ))
             self._grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=10.0
+                self.base_model.parameters(), max_norm=10.0
             ).item()
         else:
             self._grad_norm = 0.0
 
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
 
     def zero_grad(self):
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
     def get_loss(self) -> float:
         return self.loss.item()
@@ -345,8 +408,9 @@ class AutoDriveTrainer:
             "global_step":   global_step,
             "best_val_loss": best_val_loss,
             "train_mode":    self.train_mode,
-            "model":         self.model.state_dict(),
+            "model":         self.base_model.state_dict(),
             "optimizer":     self.optimizer.state_dict(),
+            "scaler":        self.scaler.state_dict(),
         }, path)
 
     def load_checkpoint(self, path: str) -> tuple[int, int, float]:
@@ -358,11 +422,13 @@ class AutoDriveTrainer:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
         if isinstance(ckpt, dict) and "model" in ckpt:
-            self.model.load_state_dict(ckpt["model"])
+            self.base_model.load_state_dict(ckpt["model"])
             try:
                 self.optimizer.load_state_dict(ckpt["optimizer"])
             except Exception:
                 print("  Optimizer state not restored (parameter groups changed).")
+            if "scaler" in ckpt:
+                self.scaler.load_state_dict(ckpt["scaler"])
             start_epoch   = ckpt.get("epoch", 0)
             global_step   = ckpt.get("global_step", 0)
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
@@ -370,7 +436,7 @@ class AutoDriveTrainer:
             print(f"  Resuming epoch {start_epoch + 1}, step {global_step}, "
                   f"best_val {best_val_loss:.4f}  (saved mode: {saved_mode})")
         else:
-            self.model.load_state_dict(ckpt)
+            self.base_model.load_state_dict(ckpt)
             start_epoch = global_step = 0
             best_val_loss = float("inf")
             print("  Weights-only checkpoint — counters reset.")
@@ -378,7 +444,61 @@ class AutoDriveTrainer:
         return start_epoch, global_step, best_val_loss
 
     def save_model(self, path: str):
-        torch.save(self.model.state_dict(), path)
+        torch.save(self.base_model.state_dict(), path)
+
+    def export_onnx(self, path: str, opset: int = 13,
+                    input_shape=(1, 3, 512, 1024), simplify: bool = True):
+        """Export the uncompiled FP32 inference graph with two image inputs."""
+        import onnx
+
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        export_model = copy.deepcopy(self.base_model).cpu().float().eval()
+        image_prev = torch.randn(*input_shape, dtype=torch.float32)
+        image_curr = torch.randn(*input_shape, dtype=torch.float32)
+
+        with torch.inference_mode():
+            outputs = export_model(image_prev, image_curr)
+            print("ONNX output shapes:", [tuple(x.shape) for x in outputs])
+            torch.onnx.export(
+                export_model,
+                (image_prev, image_curr),
+                str(output_path),
+                export_params=True,
+                opset_version=opset,
+                do_constant_folding=True,
+                input_names=["image_prev", "image_curr"],
+                output_names=["distance", "curvature", "flag_logit"],
+                dynamic_axes=None,
+                training=torch.onnx.TrainingMode.EVAL,
+                external_data=False,
+                dynamo=False,
+            )
+
+        graph = onnx.load(str(output_path))
+        if simplify:
+            try:
+                import onnxsim
+                graph, ok = onnxsim.simplify(
+                    graph,
+                    overwrite_input_shapes={
+                        "image_prev": list(input_shape),
+                        "image_curr": list(input_shape),
+                    },
+                )
+                if not ok:
+                    raise RuntimeError("onnxsim output consistency check failed")
+            except ImportError:
+                print("onnxsim not installed: skipping simplification")
+
+        # Reaction 3.47 accepts ONNX IR <= 9.
+        if graph.ir_version > 9:
+            graph.ir_version = 9
+        onnx.checker.check_model(graph, full_check=True)
+        onnx.save_model(graph, str(output_path), save_as_external_data=False)
+        print(f"ONNX exported: {output_path}")
+        del export_model
 
     # ------------------------------------------------------------------
     # TensorBoard — per step
@@ -391,6 +511,23 @@ class AutoDriveTrainer:
         self.writer.add_scalar("Loss/train_distance",  self.loss_distance,    step)
         self.writer.add_scalar("Loss/train_flag",      self.loss_flag,        step)
         self.writer.add_scalar("Metrics/grad_norm",    self._grad_norm,       step)
+        self.writer.add_scalar("Gradients/max_abs",    self._grad_max_abs,    step)
+        self.writer.add_scalar("Gradients/nonfinite",  self._grad_nonfinite,  step)
+        self.writer.add_scalar("Parameters/l2_norm",   self._param_norm,      step)
+        if self._param_norm > 0:
+            self.writer.add_scalar(
+                "Optimization/lr_grad_over_param",
+                self.learning_rate * self._grad_norm / self._param_norm,
+                step,
+            )
+        self.writer.add_scalar("AMP/scale",            self.scaler.get_scale(), step)
+        for index, group in enumerate(self.optimizer.param_groups):
+            self.writer.add_scalar(f"LearningRate/group_{index}", group["lr"], step)
+        if torch.cuda.is_available():
+            self.writer.add_scalar("Memory/cuda_allocated_GB",
+                                   torch.cuda.memory_allocated() / 1024**3, step)
+            self.writer.add_scalar("Memory/cuda_reserved_GB",
+                                   torch.cuda.memory_reserved() / 1024**3, step)
 
     def log_histograms(self, step: int):
         """Output distribution histograms — call every N steps."""

@@ -36,6 +36,15 @@ Resume after crash
 TensorBoard:
   tensorboard --logdir ~/Downloads/data/zod/training/autodrive/<run_name>/tensorboard/
 
+Optimised example (same objective, faster execution):
+  python Models/training/train_auto_drive.py \
+      --root ~/Downloads/data/zod \
+      --run-name effnet_lite0 \
+      --encoder-name tf_efficientnet_lite0 --encoder-pretrained \
+      --autospeed-ckpt /path/to/autospeed_best.pt \
+      --tf32 --amp --torch-compile --cudnn-benchmark \
+      --export-onnx runs/autodrive/effnet_lite0/autodrive_best.onnx
+
 Scalars
 -------
   Loss/train_avg_*         epoch-averaged train losses (smooth)
@@ -51,6 +60,8 @@ Scalars
 """
 
 import sys
+import time
+import argparse
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -103,11 +114,42 @@ def main():
     parser.add_argument("--epochs",       type=int, default=50)
     parser.add_argument("--batch-size",   type=int, default=16)
     parser.add_argument("--workers",      type=int, default=2)
+    parser.add_argument("--encoder-name", default=None,
+                        help="Optional timm encoder, e.g. tf_efficientnet_lite0")
+    parser.add_argument("--encoder-pretrained", action="store_true",
+                        help="Load timm ImageNet weights before training")
+    parser.add_argument("--tf32", action="store_true",
+                        help="Enable TF32 for CUDA matmul and cuDNN")
+    parser.add_argument("--amp", action="store_true",
+                        help="Enable CUDA FP16 autocast + GradScaler")
+    parser.add_argument("--torch-compile", action="store_true",
+                        help="Compile only the training forward graph")
+    parser.add_argument("--compile-mode", default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"])
+    parser.add_argument("--cudnn-benchmark", action="store_true",
+                        help="Benchmark fixed-shape cuDNN kernels")
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction,
+                        default=True)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction,
+                        default=True)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--export-onnx", default="",
+                        help="Output .onnx path; exports the best checkpoint after training")
+    parser.add_argument("--onnx-opset", type=int, default=13)
+    parser.add_argument("--no-onnx-simplify", action="store_true")
     parser.add_argument("--log-every",    type=int, default=100,
                         help="Log per-step scalars + histograms every N steps")
     parser.add_argument("--vis-every",    type=int, default=500,
                         help="Save visualization image to TensorBoard every N steps")
     args = parser.parse_args()
+
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    torch.backends.cudnn.allow_tf32 = args.tf32
+    if args.tf32:
+        torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark
+    print(f"TF32: {'enabled' if args.tf32 else 'disabled'}")
+    print(f"cuDNN benchmark: {'enabled' if args.cudnn_benchmark else 'disabled'}")
 
     # ------------------------------------------------------------------
     # Output directories
@@ -143,17 +185,26 @@ def main():
     # ------------------------------------------------------------------
     data = LoadDataAutoDrive(args.root)
 
+    loader_options = dict(
+        num_workers=args.workers,
+        collate_fn=_collate,
+        pin_memory=args.pin_memory,
+        persistent_workers=(args.persistent_workers and args.workers > 0),
+    )
+    if args.workers > 0:
+        loader_options["prefetch_factor"] = args.prefetch_factor
+
     train_loader = DataLoader(
         data.train, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, collate_fn=_collate, drop_last=True,
+        drop_last=True, **loader_options,
     )
     val_loader = DataLoader(
         data.val, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, collate_fn=_collate,
+        **loader_options,
     )
     test_loader = DataLoader(
         data.test, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, collate_fn=_collate,
+        **loader_options,
     )
 
     steps_per_epoch = len(train_loader)
@@ -167,6 +218,11 @@ def main():
         tensorboard_dir=str(tb_dir),
         train_mode=args.train_mode,
         autospeed_ckpt=args.autospeed_ckpt,
+        encoder_name=args.encoder_name,
+        encoder_pretrained=args.encoder_pretrained,
+        amp=args.amp,
+        torch_compile=args.torch_compile,
+        compile_mode=args.compile_mode,
     )
     trainer._apply_train_mode()
     trainer.zero_grad()
@@ -215,6 +271,9 @@ def main():
     # Training loop
     # ------------------------------------------------------------------
     for epoch in range(start_epoch, args.epochs):
+        epoch_start = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1}/{args.epochs}  "
               f"(mode={args.train_mode}, global_step={global_step})")
@@ -255,6 +314,20 @@ def main():
                 trainer.save_visualization(global_step)
 
         trainer.log_train_epoch(epoch + 1)
+        epoch_seconds = time.perf_counter() - epoch_start
+        trainer.writer.add_scalar("Performance/epoch_seconds", epoch_seconds, epoch + 1)
+        trainer.writer.add_scalar(
+            "Performance/train_samples_per_second",
+            len(train_loader.dataset) / max(epoch_seconds, 1e-9),
+            epoch + 1,
+        )
+        if torch.cuda.is_available():
+            trainer.writer.add_scalar("Memory/cuda_peak_allocated_GB",
+                                      torch.cuda.max_memory_allocated() / 1024**3,
+                                      epoch + 1)
+            trainer.writer.add_scalar("Memory/cuda_peak_reserved_GB",
+                                      torch.cuda.max_memory_reserved() / 1024**3,
+                                      epoch + 1)
 
         # Save checkpoint every epoch
         trainer.save_checkpoint(ckpt_last, epoch + 1, global_step, best_val_loss)
@@ -297,6 +370,15 @@ def main():
         f"steer_mae {t_steer_mae:.2f}°  d {t_dist:.4f}  f {t_flag:.4f} c {t_curv:.4f}"  
         f"flag_acc {t_acc:.1f}%  dist_mae {t_mae:.1f} m"
     )
+
+    if args.export_onnx:
+        if Path(ckpt_best).exists():
+            trainer.load_checkpoint(ckpt_best)
+        trainer.export_onnx(
+            args.export_onnx,
+            opset=args.onnx_opset,
+            simplify=not args.no_onnx_simplify,
+        )
 
     trainer.cleanup()
 

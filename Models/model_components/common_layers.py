@@ -163,22 +163,63 @@ class C3K(torch.nn.Module):
         return self.conv3(torch.cat((y, self.conv2(x)), dim=1))
 
 
+
+#compatible version for the V4M CNNIP. slice is supported on H and W dimensions, but not on C dimension.
 class C3K2(torch.nn.Module):
-    def __init__(self, in_ch, out_ch, n, csp, r):
+    def __init__(self, in_ch, out_ch, n, csp, r=2):
         super().__init__()
-        self.conv1 = Conv(in_ch, 2 * (out_ch // r), activation=torch.nn.SiLU())
-        self.conv2 = Conv((2 + n) * (out_ch // r), out_ch, activation=torch.nn.SiLU())
+
+        hidden = out_ch // r
+
+        self.branch_short = Conv(
+            in_ch,
+            hidden,
+            k=1,
+            activation=torch.nn.SiLU(),
+        )
+
+        self.branch_deep = Conv(
+            in_ch,
+            hidden,
+            k=1,
+            activation=torch.nn.SiLU(),
+        )
 
         if not csp:
-            self.res_m = torch.nn.ModuleList(Residual(out_ch // r) for _ in range(n))
+            self.res_m = torch.nn.ModuleList(
+                Residual(hidden) for _ in range(n)
+            )
         else:
-            self.res_m = torch.nn.ModuleList(C3K(out_ch // r, out_ch // r) for _ in range(n))
+            self.res_m = torch.nn.ModuleList(
+                C3K(hidden, hidden) for _ in range(n)
+            )
+
+        self.conv2 = Conv(
+            (2 + n) * hidden,
+            out_ch,
+            k=1,
+            activation=torch.nn.SiLU(),
+        )
 
     def forward(self, x):
-        y = list(self.conv1(x).chunk(2, 1))
-        y.extend(m(y[-1]) for m in self.res_m)
-        return self.conv2(torch.cat(y, dim=1))
+        #apply conv branch to input tensor
+        short = self.branch_short(x)
 
+        #apply conv branch to input tensor
+        deep = self.branch_deep(x)
+
+        features = [short, deep]
+
+        for block in self.res_m:
+            #apply residual block to deep branch
+            deep = block(deep)
+            features.append(deep)
+
+        features = torch.cat(features, dim=1)
+
+        features = self.conv2(features)
+
+        return features
 
 class CTX(torch.nn.Module):
     def __init__(self, in_ch, out_ch, n, csp, r, h, w):
