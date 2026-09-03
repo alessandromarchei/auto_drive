@@ -15,7 +15,6 @@ from Models.model_components.backbones import TimmFeatureEncoder
 IMAGE_WIDTH = 1024
 IMAGE_HEIGHT = 512
 
-# AutoDrive usa la configurazione "n" di AutoSpeed.
 _WIDTH = [3, 16, 32, 64, 128, 256]
 _DEPTH = [1, 1, 1, 1, 1, 1]
 _CSP = [False, True]
@@ -23,9 +22,8 @@ _CSP = [False, True]
 
 def _remove_wrapper_prefixes(key: str) -> str:
     """
-    Rimuove prefissi introdotti da DDP e torch.compile.
 
-    Esempi:
+    Examples:
         module.net.encoder...       -> net.encoder...
         _orig_mod.net.encoder...    -> net.encoder...
         module._orig_mod.net...     -> net...
@@ -233,27 +231,42 @@ class AutoDrive(nn.Module):
 
     def forward(
         self,
-        image_prev: torch.Tensor,
         image_curr: torch.Tensor,
+        feature_prev: torch.Tensor,
     ):
         """
         Args:
-            image_prev: [B, 3, 512, 1024]
-            image_curr: [B, 3, 512, 1024]
+            image_curr:
+                Current RGB frame.
+                Shape: [B, 3, 512, 1024]
+
+            feature_prev:
+                Cached P5 feature map from the previous frame.
+                Shape: [B, 256, 16, 32]
 
         Returns:
             distance_normalized: [B, 1]
             curvature:          [B, 1]
             flag_logit:         [B, 1]
+            feature_curr:       [B, 256, 16, 32]
         """
 
-        feature_prev = self.encode(image_prev)
+        # only execute encoder on current image
         feature_curr = self.encode(image_curr)
 
-        return self.head(
+        distance, curvature, flag_logit = self.head(
             feature_prev,
             feature_curr,
         )
+
+        # feature_curr is returned so that it can be cached for the next frame
+        return (
+            distance,
+            curvature,
+            flag_logit,
+            feature_curr,
+        )
+
 
     def load_backbone_from_autospeed(
         self,
@@ -261,22 +274,8 @@ class AutoDrive(nn.Module):
         require_full_match: bool = True,
     ) -> None:
         """
-        Carica il backbone `net.*` da un checkpoint AutoSpeed.
+        Load backbone `net.*` from checkpoint AutoSpeed.
 
-        Funziona nei seguenti casi:
-
-        1. AutoSpeed originale -> AutoDrive originale
-           Entrambi devono usare la stessa configurazione "n".
-
-        2. AutoSpeed timm -> AutoDrive timm
-           Entrambi devono usare lo stesso `encoder_name` e gli stessi
-           `target_channels`.
-
-        Non è possibile trasferire direttamente:
-            AutoSpeed originale -> AutoDrive timm
-            AutoSpeed timm      -> AutoDrive originale
-
-        perché le architetture e le chiavi non corrispondono.
         """
 
         checkpoint_path = Path(
@@ -303,15 +302,12 @@ class AutoDrive(nn.Module):
             checkpoint
         )
 
-        # AutoSpeed salva il backbone dentro self.net.
         autospeed_backbone_state = {
             key[len("net."):]: value
             for key, value in autospeed_state_dict.items()
             if key.startswith("net.")
         }
 
-        # Supporta anche un eventuale checkpoint contenente solamente
-        # il backbone, senza prefisso net.
         if not autospeed_backbone_state:
             autospeed_backbone_state = autospeed_state_dict
 

@@ -245,7 +245,14 @@ class AutoDriveTrainer:
             if self.amp_enabled else nullcontext()
         )
         with amp_context:
-            d_pred, curv_pred, flag_logits = self.model(self.img_prev, self.img_curr)
+            #at training time, encode the previous image first
+            feature_prev = self.base_model.encode(self.img_prev)
+
+            #once previous features are computed, run the model with the current image and previous features
+            d_pred, curv_pred, flag_logits, feature_curr = self.model(
+                self.img_curr,
+                feature_prev,
+            )
 
         # Keep reductions/loss accumulation in FP32 when AMP is active.
         # The objective itself is unchanged from the original trainer.
@@ -308,7 +315,9 @@ class AutoDriveTrainer:
             if self.amp_enabled else nullcontext()
         )
         with amp_context:
-            d_pred, curv_pred, flag_logits = self.model(self.img_prev, self.img_curr)
+            # At validation time, encode the previous image first
+            feature_prev = self.base_model.encode(self.img_prev)
+            d_pred, curv_pred, flag_logits = self.model(feature_prev=feature_prev, feature_curr=self.img_curr)
 
         d_pred = d_pred.float()
         curv_pred = curv_pred.float()
@@ -455,21 +464,30 @@ class AutoDriveTrainer:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         export_model = copy.deepcopy(self.base_model).cpu().float().eval()
-        image_prev = torch.randn(*input_shape, dtype=torch.float32)
+        
+        feature_prev = torch.zeros(1, 256, 16, 32, dtype=torch.float32,)
         image_curr = torch.randn(*input_shape, dtype=torch.float32)
 
         with torch.inference_mode():
-            outputs = export_model(image_prev, image_curr)
+            outputs = export_model(feature_prev=feature_prev, image_curr=image_curr)
             print("ONNX output shapes:", [tuple(x.shape) for x in outputs])
             torch.onnx.export(
                 export_model,
-                (image_prev, image_curr),
-                str(output_path),
+                (image_curr, feature_prev),
+                output_path,
                 export_params=True,
-                opset_version=opset,
+                opset_version=13,
                 do_constant_folding=True,
-                input_names=["image_prev", "image_curr"],
-                output_names=["distance", "curvature", "flag_logit"],
+                input_names=[
+                    "image_curr",
+                    "feature_prev",
+                ],
+                output_names=[
+                    "distance",
+                    "curvature",
+                    "flag_logit",
+                    "feature_curr",
+                ],
                 dynamic_axes=None,
                 training=torch.onnx.TrainingMode.EVAL,
                 external_data=False,
@@ -483,7 +501,7 @@ class AutoDriveTrainer:
                 graph, ok = onnxsim.simplify(
                     graph,
                     overwrite_input_shapes={
-                        "image_prev": list(input_shape),
+                        "feature_prev": list(input_shape),
                         "image_curr": list(input_shape),
                     },
                 )
