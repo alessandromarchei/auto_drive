@@ -64,7 +64,7 @@ import time
 import argparse
 from argparse import ArgumentParser
 from pathlib import Path
-
+import math
 import torch
 import tqdm
 from torch.utils.data import DataLoader
@@ -141,6 +141,17 @@ def main():
                         help="Log per-step scalars + histograms every N steps")
     parser.add_argument("--vis-every",    type=int, default=500,
                         help="Save visualization image to TensorBoard every N steps")
+    parser.add_argument("--lr_schedule", default="cosine",
+                        choices=["cosine", "fixed"],
+                        help="Learning rate schedule: 'cosine' or 'fixed'")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Peak learning rate reached after warm-up")
+    parser.add_argument("--min-lr", type=float, default=1e-6,
+                        help="Final learning rate of cosine decay")
+    parser.add_argument("--warmup-epochs", type=float, default=2.0,
+                        help="Number of linear warm-up epochs")
+    parser.add_argument("--warmup-start-factor", type=float, default=0.1,
+                        help="Initial LR as a fraction of --lr")
     args = parser.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
@@ -247,10 +258,25 @@ def main():
     if resume_path:
         start_epoch, global_step, best_val_loss = trainer.load_checkpoint(resume_path)
 
+
+
+    # ------------------------------------------------------------------
+    # Warm-up + cosine LR schedule
+    # ------------------------------------------------------------------
+    total_steps = args.epochs * steps_per_epoch
+    warmup_steps = int(args.warmup_epochs * steps_per_epoch)
+
+    max_lr = args.lr
+    min_lr = args.min_lr
+    warmup_start_lr = max_lr * args.warmup_start_factor
+
+
+
     # ------------------------------------------------------------------
     # LR schedule helper
     # ------------------------------------------------------------------
-    def _get_lr(epoch: int, mode: str) -> float:
+    def _get_lr(function: str, step: int, epoch: int, mode: str) -> float:
+
         """
         Curvature mode (head-only):
             epochs 0-9  : 3e-4
@@ -260,12 +286,26 @@ def main():
             epochs 15-34: 3e-5
             epochs 35+  : 1e-5
         """
-        if mode == TRAIN_MODE_CURVATURE:
-            return 3e-4 if epoch < 10 else 3e-5
-        else:
-            if epoch < 15:  return 1e-4
-            if epoch < 35:  return 3e-5
-            return 1e-5
+        if (function == "cosine"):
+            if warmup_steps > 0 and step < warmup_steps:
+                progress = step / max(1, warmup_steps)
+                return warmup_start_lr + progress * (max_lr - warmup_start_lr)
+
+            cosine_steps = max(1, total_steps - warmup_steps)
+            progress = (step - warmup_steps) / cosine_steps
+            progress = min(max(progress, 0.0), 1.0)
+
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            return min_lr + (max_lr - min_lr) * cosine_factor
+
+        elif (function == "fixed"):
+            if mode == TRAIN_MODE_CURVATURE:
+                return 3e-4 if epoch < 10 else 3e-5
+            else:
+                if epoch < 15:  return 1e-4
+                if epoch < 35:  return 3e-5
+                return 1e-5
 
     # ------------------------------------------------------------------
     # Training loop
@@ -278,7 +318,7 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs}  "
               f"(mode={args.train_mode}, global_step={global_step})")
 
-        lr = _get_lr(epoch, args.train_mode)
+        lr = _get_lr(args.lr_schedule, global_step, epoch, args.train_mode)
         trainer.set_learning_rate(lr)
 
         trainer.set_train_mode()
@@ -309,6 +349,12 @@ def main():
             if global_step % args.log_every == 0:
                 trainer.log_train_step(global_step)
                 trainer.log_histograms(global_step)
+                trainer.writer.add_scalar(
+                    "LearningRate/lr",
+                    lr,
+                    global_step,
+                )
+
 
             if global_step % args.vis_every == 0:
                 trainer.save_visualization(global_step)

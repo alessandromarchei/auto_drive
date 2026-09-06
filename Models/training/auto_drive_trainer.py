@@ -317,7 +317,7 @@ class AutoDriveTrainer:
         with amp_context:
             # At validation time, encode the previous image first
             feature_prev = self.base_model.encode(self.img_prev)
-            d_pred, curv_pred, flag_logits = self.model(feature_prev=feature_prev, feature_curr=self.img_curr)
+            d_pred, curv_pred, flag_logits, feature_curr = self.model(feature_prev=feature_prev, image_curr=self.img_curr)
 
         d_pred = d_pred.float()
         curv_pred = curv_pred.float()

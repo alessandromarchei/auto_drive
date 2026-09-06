@@ -40,17 +40,17 @@ class AutoDriveHead(nn.Module):
         self.conv_1 = nn.Conv2d(concat_c, 256, kernel_size=3, stride=1, padding=1)
         self.conv_2 = nn.Conv2d(256, 64, kernel_size=3, stride=1, padding=1)
         self.conv_3 = nn.Conv2d(64, 2, kernel_size=3, stride=1, padding=1)
-        self.act = nn.SiLU(inplace=True)
+        self.act = nn.SiLU(inplace=False)
 
         flat_dim = 2 * p5_h * p5_w
         self.fc1 = nn.Sequential(
             nn.Linear(flat_dim, 768),
-            nn.SiLU(inplace=True),
+            nn.SiLU(inplace=False),
             nn.Dropout(p=0.1),
         )
         self.fc2 = nn.Sequential(
             nn.Linear(768, 512),
-            nn.SiLU(inplace=True),
+            nn.SiLU(inplace=False),
             nn.Dropout(p=0.1),
         )
 

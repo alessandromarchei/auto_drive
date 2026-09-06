@@ -191,11 +191,11 @@ class AutoDrive(nn.Module):
                 f"of feature maps, got {type(backbone_output).__name__}"
             )
 
-        if len(backbone_output) != 4:
-            raise RuntimeError(
-                "TimmFeatureEncoder was expected to return four feature "
-                f"maps at OS=4,8,16,32, but returned {len(backbone_output)}"
-            )
+        # if len(backbone_output) != 3 or len(backbone_output) != 4:
+        #     raise RuntimeError(
+        #         "TimmFeatureEncoder was expected to return four feature "
+        #         f"maps at OS=4,8,16,32, but returned {len(backbone_output)}"
+        #     )
 
         p5 = backbone_output[-1]
 
