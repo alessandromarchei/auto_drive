@@ -197,26 +197,53 @@ def main():
     # ------------------------------------------------------------------
     data = LoadDataAutoDrive(args.root)
 
-    loader_options = dict(
+    train_loader_options = dict(
         num_workers=args.workers,
         collate_fn=_collate,
         pin_memory=args.pin_memory,
-        persistent_workers=(args.persistent_workers and args.workers > 0),
+        persistent_workers=(
+            args.persistent_workers and args.workers > 0
+        ),
     )
+
     if args.workers > 0:
-        loader_options["prefetch_factor"] = args.prefetch_factor
+        train_loader_options["prefetch_factor"] = args.prefetch_factor
+
+
+    # Validation/test: deliberately conservative on RAM
+    eval_workers = min(args.workers, 2)
+
+    eval_loader_options = dict(
+        num_workers=eval_workers,
+        collate_fn=_collate,
+        pin_memory=False,
+        persistent_workers=False,
+    )
+
+    if eval_workers > 0:
+        eval_loader_options["prefetch_factor"] = 1
+
 
     train_loader = DataLoader(
-        data.train, batch_size=args.batch_size, shuffle=True,
-        drop_last=True, **loader_options,
+        data.train,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        **train_loader_options,
     )
+
     val_loader = DataLoader(
-        data.val, batch_size=args.batch_size, shuffle=False,
-        **loader_options,
+        data.val,
+        batch_size=args.batch_size,
+        shuffle=False,
+        **eval_loader_options,
     )
+
     test_loader = DataLoader(
-        data.test, batch_size=args.batch_size, shuffle=False,
-        **loader_options,
+        data.test,
+        batch_size=args.batch_size,
+        shuffle=False,
+        **eval_loader_options,
     )
 
     steps_per_epoch = len(train_loader)
