@@ -15,7 +15,11 @@ from torch import nn, optim
 from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from Models.model_components.autodrive.autodrive_network import AutoDrive
+from Models.model_components.autodrive.autodrive_network import (
+    AutoDrive,
+    AutoDriveTrainingWrapper,
+    AutoDriveStreamingWrapper,
+)
 from Models.data_utils.load_data_auto_drive import CURV_SCALE
 
 
@@ -91,8 +95,6 @@ class AutoDriveTrainer:
         self.train_mode = train_mode
         print(f"AutoDriveTrainer — device: {self.device}  mode: {train_mode}")
 
-        self.amp_enabled = bool(amp and self.device.type == "cuda")
-        print(f"AMP: {self.amp_enabled}  (mode={amp})")
         self.compile_enabled = bool(torch_compile)
 
         # Keep an unwrapped model for checkpoints, freezing and ONNX export.
@@ -105,16 +107,23 @@ class AutoDriveTrainer:
         if autospeed_ckpt:
             self.base_model.load_backbone_from_autospeed(autospeed_ckpt)
 
-        self.model = self.base_model
+        # Training and deployment intentionally expose different signatures,
+        # while sharing exactly the same base_model parameters.
+        self.training_model = AutoDriveTrainingWrapper(
+            self.base_model
+        ).to(self.device)
+        self.model = self.training_model
         if self.compile_enabled:
             if not hasattr(torch, "compile"):
                 raise RuntimeError("--torch-compile requires PyTorch >= 2.0")
             print(f"torch.compile: enabled (mode={compile_mode})")
-            self.model = torch.compile(self.base_model, mode=compile_mode)
+            self.model = torch.compile(
+                self.training_model,
+                mode=compile_mode,
+                fullgraph=False,
+            )
         else:
             print("torch.compile: disabled")
-
-        print(f"AMP: {'enabled' if self.amp_enabled else 'disabled'}")
 
         if amp == "fp16":
             self.amp_enabled = True
@@ -135,6 +144,11 @@ class AutoDriveTrainer:
             self.amp_enabled = False
             self.amp_dtype = torch.float32
             self.scaler_enabled = False
+
+        print(
+            f"AMP: {amp if self.amp_enabled else 'off'} "
+            f"(GradScaler={'on' if self.scaler_enabled else 'off'})"
+        )
 
         self.scaler = torch.amp.GradScaler(
             "cuda",
@@ -270,13 +284,11 @@ class AutoDriveTrainer:
             if self.amp_enabled else nullcontext()
         )
         with amp_context:
-            #at training time, encode the previous image first
-            feature_prev = self.base_model.encode(self.img_prev)
-
-            #once previous features are computed, run the model with the current image and previous features
-            d_pred, curv_pred, flag_logits, feature_curr = self.model(
+            # Both images enter one compiled graph. The wrapper concatenates
+            # them on batch and invokes the shared encoder once with 2B.
+            d_pred, curv_pred, flag_logits = self.model(
+                self.img_prev,
                 self.img_curr,
-                feature_prev,
             )
 
         # Keep reductions/loss accumulation in FP32 when AMP is active.
@@ -340,9 +352,10 @@ class AutoDriveTrainer:
             if self.amp_enabled else nullcontext()
         )
         with amp_context:
-            # At validation time, encode the previous image first
-            feature_prev = self.base_model.encode(self.img_prev)
-            d_pred, curv_pred, flag_logits, feature_curr = self.model(feature_prev=feature_prev, image_curr=self.img_curr)
+            d_pred, curv_pred, flag_logits = self.model(
+                self.img_prev,
+                self.img_curr,
+            )
 
         d_pred = d_pred.float()
         curv_pred = curv_pred.float()
@@ -482,26 +495,31 @@ class AutoDriveTrainer:
 
     def export_onnx(self, path: str, opset: int = 13,
                     input_shape=(1, 3, 512, 1024), simplify: bool = True):
-        """Export the uncompiled FP32 inference graph with two image inputs."""
+        """Export FP32 streaming graph: current image + previous P5 state."""
         import onnx
 
         output_path = Path(path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        export_model = copy.deepcopy(self.base_model).cpu().float().eval()
+        export_base_model = copy.deepcopy(
+            self.base_model
+        ).cpu().float().eval()
+        export_model = AutoDriveStreamingWrapper(
+            export_base_model
+        ).cpu().eval()
         
         feature_prev = torch.zeros(1, 256, 16, 32, dtype=torch.float32,)
         image_curr = torch.randn(*input_shape, dtype=torch.float32)
 
         with torch.inference_mode():
-            outputs = export_model(feature_prev=feature_prev, image_curr=image_curr)
+            outputs = export_model(image_curr, feature_prev)
             print("ONNX output shapes:", [tuple(x.shape) for x in outputs])
             torch.onnx.export(
                 export_model,
                 (image_curr, feature_prev),
                 output_path,
                 export_params=True,
-                opset_version=13,
+                opset_version=opset,
                 do_constant_folding=True,
                 input_names=[
                     "image_curr",
@@ -526,7 +544,7 @@ class AutoDriveTrainer:
                 graph, ok = onnxsim.simplify(
                     graph,
                     overwrite_input_shapes={
-                        "feature_prev": list(input_shape),
+                        "feature_prev": [1, 256, 16, 32],
                         "image_curr": list(input_shape),
                     },
                 )

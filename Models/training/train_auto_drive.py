@@ -42,7 +42,7 @@ Optimised example (same objective, faster execution):
       --run-name effnet_lite0 \
       --encoder-name tf_efficientnet_lite0 --encoder-pretrained \
       --autospeed-ckpt /path/to/autospeed_best.pt \
-      --tf32 --amp --torch-compile --cudnn-benchmark \
+      --tf32 --amp bf16 --torch-compile --cudnn-benchmark \
       --export-onnx runs/autodrive/effnet_lite0/autodrive_best.onnx
 
 Scalars

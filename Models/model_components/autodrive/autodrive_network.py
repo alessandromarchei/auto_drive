@@ -394,3 +394,44 @@ class AutoDrive(nn.Module):
             f"  load unexpected keys: "
             f"{len(load_result.unexpected_keys)}"
         )
+
+
+class AutoDriveTrainingWrapper(nn.Module):
+    """Compiled training graph: two images, one batched encoder invocation."""
+
+    def __init__(self, model: AutoDrive):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        image_prev: torch.Tensor,
+        image_curr: torch.Tensor,
+    ):
+        # [B,3,H,W] + [B,3,H,W] -> [2B,3,H,W]. This preserves
+        # gradients from both frames while giving torch.compile one graph.
+        images = torch.cat((image_prev, image_curr), dim=0)
+        features = self.model.encode(images)
+        feature_prev, feature_curr = torch.chunk(features, 2, dim=0)
+
+        return self.model.head(feature_prev, feature_curr)
+
+
+class AutoDriveStreamingWrapper(nn.Module):
+    """Deployment graph: current image + cached previous P5 state."""
+
+    def __init__(self, model: AutoDrive):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        image_curr: torch.Tensor,
+        feature_prev: torch.Tensor,
+    ):
+        feature_curr = self.model.encode(image_curr)
+        distance, curvature, flag_logit = self.model.head(
+            feature_prev,
+            feature_curr,
+        )
+        return distance, curvature, flag_logit, feature_curr
