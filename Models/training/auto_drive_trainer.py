@@ -84,7 +84,7 @@ class AutoDriveTrainer:
                  autospeed_ckpt: str = "",
                  encoder_name: str | None = None,
                  encoder_pretrained: bool = False,
-                 amp: bool = False,
+                 amp: str | None = None,
                  torch_compile: bool = False,
                  compile_mode: str = "default"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -92,6 +92,7 @@ class AutoDriveTrainer:
         print(f"AutoDriveTrainer — device: {self.device}  mode: {train_mode}")
 
         self.amp_enabled = bool(amp and self.device.type == "cuda")
+        print(f"AMP: {self.amp_enabled}  (mode={amp})")
         self.compile_enabled = bool(torch_compile)
 
         # Keep an unwrapped model for checkpoints, freezing and ONNX export.
@@ -114,7 +115,31 @@ class AutoDriveTrainer:
             print("torch.compile: disabled")
 
         print(f"AMP: {'enabled' if self.amp_enabled else 'disabled'}")
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+
+        if amp == "fp16":
+            self.amp_enabled = True
+            self.amp_dtype = torch.float16
+            self.scaler_enabled = True
+
+        elif amp == "bf16":
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError(
+                    "BF16 is not supported by this CUDA device"
+                )
+
+            self.amp_enabled = True
+            self.amp_dtype = torch.bfloat16
+            self.scaler_enabled = False
+
+        else:
+            self.amp_enabled = False
+            self.amp_dtype = torch.float32
+            self.scaler_enabled = False
+
+        self.scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=self.scaler_enabled,
+        )
 
         self.writer = SummaryWriter(log_dir=tensorboard_dir)
 
@@ -241,7 +266,7 @@ class AutoDriveTrainer:
 
     def run_model(self):
         amp_context = (
-            torch.autocast(device_type="cuda", dtype=torch.float16)
+            torch.autocast(device_type="cuda", dtype=self.amp_dtype)
             if self.amp_enabled else nullcontext()
         )
         with amp_context:
@@ -311,7 +336,7 @@ class AutoDriveTrainer:
         self.set_batch(batch)
 
         amp_context = (
-            torch.autocast(device_type="cuda", dtype=torch.float16)
+            torch.autocast(device_type="cuda", dtype=self.amp_dtype)
             if self.amp_enabled else nullcontext()
         )
         with amp_context:

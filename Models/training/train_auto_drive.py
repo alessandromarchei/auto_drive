@@ -121,8 +121,8 @@ def main():
                         help="Load timm ImageNet weights before training")
     parser.add_argument("--tf32", action="store_true",
                         help="Enable TF32 for CUDA matmul and cuDNN")
-    parser.add_argument("--amp", action="store_true",
-                        help="Enable CUDA FP16 autocast + GradScaler")
+    parser.add_argument("--amp", choices=["fp16", "bf16", "off"], default="off",
+                        help="Enable CUDA automatic mixed precision (AMP) for training. ")
     parser.add_argument("--torch-compile", action="store_true",
                         help="Compile only the training forward graph")
     parser.add_argument("--compile-mode", default="default",
@@ -133,7 +133,7 @@ def main():
                         default=True)
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction,
                         default=True)
-    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument("--export-onnx", default="artifacts/autodrive_best.onnx", type=str,
                         help="Output .onnx path; exports the best checkpoint after training")
     parser.add_argument("--onnx-opset", type=int, default=13)

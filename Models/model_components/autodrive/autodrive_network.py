@@ -251,6 +251,9 @@ class AutoDrive(nn.Module):
             feature_curr:       [B, 256, 16, 32]
         """
 
+        #detach feature_prev to avoid backprop through previous frame
+        feature_prev = feature_prev.detach()
+        
         # only execute encoder on current image
         feature_curr = self.encode(image_curr)
 
