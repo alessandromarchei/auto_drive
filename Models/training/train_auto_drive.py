@@ -99,6 +99,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("--root",         required=True,
                         help="ZOD dataset root — outputs go under {root}/training/autodrive/<run-name>/")
+    parser.add_argument('--runs_dir', default="runs/autodrive", type=str, help="Directory to save training runs. Default: 'runs/autodrive'")
     parser.add_argument("--run-name",     default="",
                         help="Sub-folder name for this run (default: auto-numbered run001, run002, …)")
     parser.add_argument("--train-mode",   default=TRAIN_MODE_JOINT,
@@ -133,7 +134,7 @@ def main():
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction,
                         default=True)
     parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--export-onnx", default="",
+    parser.add_argument("--export-onnx", default="artifacts/autodrive_best.onnx", type=str,
                         help="Output .onnx path; exports the best checkpoint after training")
     parser.add_argument("--onnx-opset", type=int, default=13)
     parser.add_argument("--no-onnx-simplify", action="store_true")
@@ -165,7 +166,7 @@ def main():
     # ------------------------------------------------------------------
     # Output directories
     # ------------------------------------------------------------------
-    base_dir = Path(args.root) / "training" / "autodrive"
+    base_dir = Path(args.runs_dir)
 
     if args.run_name:
         run_name = args.run_name
