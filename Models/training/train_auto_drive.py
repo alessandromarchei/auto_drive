@@ -319,9 +319,6 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs}  "
               f"(mode={args.train_mode}, global_step={global_step})")
 
-        lr = _get_lr(args.lr_schedule, global_step, epoch, args.train_mode)
-        trainer.set_learning_rate(lr)
-
         trainer.set_train_mode()
         trainer.reset_averages()
 
@@ -331,6 +328,12 @@ def main():
         )
 
         for batch in p_bar:
+
+            #update learning rate and run training step
+            lr = _get_lr(args.lr_schedule, global_step, epoch, args.train_mode)
+            trainer.set_learning_rate(lr)
+
+            
             trainer.set_batch(batch)
             trainer.run_model()
             trainer.loss_backward()
