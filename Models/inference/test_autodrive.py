@@ -461,44 +461,44 @@ def main():
     # ------------------------------------------------------------------
 
     result_text = f"""AutoDrive Test Results
-======================
+        ======================
 
-Checkpoint
-----------
-path: {checkpoint}
-epoch: {start_epoch}
-global_step: {global_step}
-best_val_loss: {best_val_loss}
+        Checkpoint
+        ----------
+        path: {checkpoint}
+        epoch: {start_epoch}
+        global_step: {global_step}
+        best_val_loss: {best_val_loss}
 
-Model
------
-encoder: {args.encoder_name}
-amp: {args.amp}
+        Model
+        -----
+        encoder: {args.encoder_name}
+        amp: {args.amp}
 
-Dataset
--------
-root: {args.root}
-test_samples: {num_samples}
-batch_size: {args.batch_size}
+        Dataset
+        -------
+        root: {args.root}
+        test_samples: {num_samples}
+        batch_size: {args.batch_size}
 
-Metrics
--------
-total_loss: {t_total:.8f}
-distance_loss: {t_dist:.8f}
-curvature_loss: {t_curv:.8f}
-flag_loss: {t_flag:.8f}
+        Metrics
+        -------
+        total_loss: {t_total:.8f}
+        distance_loss: {t_dist:.8f}
+        curvature_loss: {t_curv:.8f}
+        flag_loss: {t_flag:.8f}
 
-flag_accuracy_percent: {t_acc:.4f}
-distance_mae_m: {t_mae:.6f}
-steering_mae_deg: {t_steer_mae:.6f}
+        flag_accuracy_percent: {t_acc:.4f}
+        distance_mae_m: {t_mae:.6f}
+        steering_mae_deg: {t_steer_mae:.6f}
 
-Performance
------------
-elapsed_seconds: {elapsed:.4f}
-samples_per_second: {samples_per_second:.4f}
-cuda_peak_allocated_GB: {peak_allocated:.4f}
-cuda_peak_reserved_GB: {peak_reserved:.4f}
-"""
+        Performance
+        -----------
+        elapsed_seconds: {elapsed:.4f}
+        samples_per_second: {samples_per_second:.4f}
+        cuda_peak_allocated_GB: {peak_allocated:.4f}
+        cuda_peak_reserved_GB: {peak_reserved:.4f}
+        """
 
     results_path.write_text(result_text)
 
