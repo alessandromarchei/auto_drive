@@ -10,16 +10,19 @@ class TimmFeatureEncoder(torch.nn.Module):
         model_name,
         target_channels,
         pretrained=False,
+        drop_path_rate=0.0,
     ):
         super().__init__()
 
         self.model_name = model_name
+        self.drop_path_rate = drop_path_rate
 
         self.encoder = timm.create_model(
             model_name,
             pretrained=pretrained,
             features_only=True,
             exportable=True,
+            drop_path_rate=self.drop_path_rate,
         )
 
         reductions = list(

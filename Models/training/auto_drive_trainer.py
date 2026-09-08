@@ -90,7 +90,8 @@ class AutoDriveTrainer:
                  encoder_pretrained: bool = False,
                  amp: str | None = None,
                  torch_compile: bool = False,
-                 compile_mode: str = "default"):
+                 compile_mode: str = "default",
+                 drop_path_rate: float = 0.0):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.train_mode = train_mode
         print(f"AutoDriveTrainer — device: {self.device}  mode: {train_mode}")
@@ -101,6 +102,7 @@ class AutoDriveTrainer:
         self.base_model = AutoDrive(
             encoder_name=encoder_name,
             encoder_pretrained=encoder_pretrained,
+            drop_path_rate=drop_path_rate,
         ).to(self.device)
 
         # Optionally load pretrained backbone from AutoSpeed

@@ -119,10 +119,21 @@ class AutoDrive(nn.Module):
         encoder_name: Optional[str] = None,
         encoder_pretrained: bool = False,
         autospeed_checkpoint_path: Optional[str] = None,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
 
         self.encoder_name = encoder_name
+        self.drop_path_rate = drop_path_rate
+
+        if self.drop_path_rate < 0.0 or self.drop_path_rate > 1.0:
+            raise ValueError(
+                "drop_path_rate must be in the range [0.0, 1.0]"
+            )
+        else:
+            print(
+                f"[AutoDrive] drop_path_rate={self.drop_path_rate}"
+            )
 
         if encoder_name is None:
             self.backbone = AutoDriveBackbone(
@@ -145,6 +156,7 @@ class AutoDrive(nn.Module):
                     _WIDTH[4],  # OS=16 -> 128
                     _WIDTH[5],  # OS=32 -> 256
                 ],
+                drop_path_rate=self.drop_path_rate
             )
 
             print(

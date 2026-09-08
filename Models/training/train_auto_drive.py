@@ -153,6 +153,8 @@ def main():
                         help="Number of linear warm-up epochs")
     parser.add_argument("--warmup-start-factor", type=float, default=0.1,
                         help="Initial LR as a fraction of --lr")
+    parser.add_argument("--drop-path-rate", type=float, default=0.0,
+                        help="Stochastic depth drop path rate for training. Maximum probability of dropping a path in the backbone. 0.0 = no drop path, 1.0 = always drop path.")
     args = parser.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
@@ -262,6 +264,7 @@ def main():
         amp=args.amp,
         torch_compile=args.torch_compile,
         compile_mode=args.compile_mode,
+        drop_path_rate=args.drop_path_rate,
     )
     trainer._apply_train_mode()
     trainer.zero_grad()
